@@ -1,0 +1,6 @@
+aiogram==3.13.1
+openpyxl==3.1.5
+aiohttp==3.10.11
+reportlab==4.4.10
+arabic-reshaper==3.0.1
+python-bidi==0.6.11
