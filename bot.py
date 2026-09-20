@@ -2,16 +2,18 @@
 ربات تلگرامی ثبت‌نام کلاس‌های کنکور ریاضی
 --------------------------------------------
 پیاده‌سازی با aiogram 3.x + SQLite
-نسخه‌ی آماده‌ی استقرار روی Render.com (Web Service, پلن رایگان)
+نسخه‌ی آماده‌ی استقرار روی Streamlit Community Cloud (اجرا به‌عنوان Subprocess از app.py)
 
 نصب پیش‌نیازها:
     pip install -r requirements.txt
 
 اجرا (لوکال):
-    python bot.py
+    BOT_TOKEN=... ADMIN_IDS=123456789 python bot.py
 
-روی Render.com، متغیرهای محیطی BOT_TOKEN و ADMIN_IDS از پنل Environment Variables
-خوانده می‌شوند. اگر تنظیم نشوند، مقادیر پیش‌فرض هاردکد شده‌ی زیر (فقط برای تست) استفاده می‌شود.
+متغیرهای محیطی:
+    BOT_TOKEN  توکن ربات (الزامی)
+    ADMIN_IDS  شناسه‌ی عددی ادمین‌ها، با کاما جدا شود (مثال: 111,222)
+    DB_PATH    (اختیاری) مسیر فایل SQLite
 """
 
 import asyncio
@@ -19,12 +21,16 @@ import logging
 import os
 import re
 import sqlite3
+import tempfile
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -38,7 +44,6 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-from aiohttp import web
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 
@@ -53,34 +58,75 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 # ============================================================
 #  تنظیمات اصلی
-#  اولویت با متغیرهای محیطی (Environment Variables) است؛
-#  مقادیر پیش‌فرض زیر فقط برای اجرای سریع و تست لوکال هستند.
+#  همه‌چیز از متغیرهای محیطی خوانده می‌شود (روی Streamlit Cloud از بخش Secrets
+#  توسط app.py به این پروسه منتقل می‌شوند).
 # ============================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+BASE_DIR = Path(__file__).resolve().parent
 
-_admin_ids_raw = os.environ.get("ADMIN_IDS", "111111111")
-ADMIN_IDS = {int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip()}
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-# پورتی که Render برای Health Check به آن درخواست می‌زند
-PORT = int(os.environ.get("PORT", 8080))
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
+}
 
-DB_PATH = "konkur_bot.db"
-EXPORT_DIR = Path("exports")
-EXPORT_DIR.mkdir(exist_ok=True)
+DB_PATH = Path(os.environ.get("DB_PATH", BASE_DIR / "konkur_bot.db"))
 
-logging.basicConfig(level=logging.INFO)
+# فایل‌های خروجی موقتی‌اند و بعد از ارسال حذف می‌شوند
+EXPORT_DIR = Path(tempfile.gettempdir()) / "konkur_exports"
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger("konkur_bot")
 
-# فونت فارسی برای PDF — این فایل باید کنار bot.py و در همان ریپازیتوری باشد
-FONT_PATH = Path(__file__).parent / "Vazirmatn-Regular.ttf"
+# ============================================================
+#  فونت فارسی PDF (Vazirmatn)
+#  اگر فایل کنار bot.py نبود، خودکار دانلود می‌شود.
+# ============================================================
+FONT_PATH = BASE_DIR / "Vazirmatn-Regular.ttf"
 PDF_FONT_NAME = "Vazirmatn"
-if FONT_PATH.exists():
-    pdfmetrics.registerFont(TTFont(PDF_FONT_NAME, str(FONT_PATH)))
-else:
-    logger.warning(
-        "فایل فونت %s پیدا نشد؛ خروجی PDF بدون فونت فارسی درست کار نخواهد کرد.",
-        FONT_PATH,
-    )
+FONT_URLS = (
+    "https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Regular.ttf",
+    "https://raw.githubusercontent.com/rastikerdar/vazirmatn/master/fonts/ttf/Vazirmatn-Regular.ttf",
+)
+_TTF_MAGIC = (b"\x00\x01\x00\x00", b"true", b"OTTO")
+
+
+def _download_font() -> bool:
+    """دانلود فونت از آینه‌های GitHub؛ فقط اگر فایل معتبر بود ذخیره می‌شود."""
+    for url in FONT_URLS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+            if len(data) < 50_000 or data[:4] not in _TTF_MAGIC:
+                logger.warning("پاسخ دانلود فونت از %s فایل TTF معتبری نبود.", url)
+                continue
+            tmp = FONT_PATH.with_name(FONT_PATH.name + ".part")
+            tmp.write_bytes(data)
+            tmp.replace(FONT_PATH)
+            logger.info("فونت فارسی دانلود شد (%d بایت).", len(data))
+            return True
+        except (OSError, TimeoutError) as exc:  # URLError هم زیرمجموعه‌ی OSError است
+            logger.warning("دانلود فونت از %s ناموفق بود: %s", url, exc)
+    return False
+
+
+def ensure_font() -> bool:
+    """فونت را (در صورت نیاز دانلود و) برای reportlab ثبت می‌کند. True یعنی آماده است."""
+    if PDF_FONT_NAME in pdfmetrics.getRegisteredFontNames():
+        return True
+    if not FONT_PATH.exists() and not _download_font():
+        return False
+    try:
+        pdfmetrics.registerFont(TTFont(PDF_FONT_NAME, str(FONT_PATH)))
+    except Exception as exc:  # noqa: BLE001 — فایل خراب؛ حذف می‌شود تا دفعه‌ی بعد دوباره دانلود شود
+        logger.error("ثبت فونت ناموفق بود (%s)؛ فایل حذف شد.", exc)
+        FONT_PATH.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def rtl(text: str) -> str:
@@ -634,10 +680,13 @@ async def admin_export(callback: CallbackQuery) -> None:
     filename = EXPORT_DIR / f"students_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     wb.save(filename)
 
-    await callback.message.answer_document(
-        FSInputFile(filename),
-        caption=f"📥 خروجی اکسل لیست دانش‌آموزان\n👥 تعداد کل: {len(students)} نفر",
-    )
+    try:
+        await callback.message.answer_document(
+            FSInputFile(filename),
+            caption=f"📥 خروجی اکسل لیست دانش‌آموزان\n👥 تعداد کل: {len(students)} نفر",
+        )
+    finally:
+        filename.unlink(missing_ok=True)
     await callback.answer("فایل اکسل ارسال شد ✅")
 
 
@@ -652,9 +701,10 @@ async def admin_export_pdf(callback: CallbackQuery) -> None:
         await callback.answer("هنوز هیچ دانش‌آموزی ثبت‌نام نکرده است.", show_alert=True)
         return
 
-    if not FONT_PATH.exists():
+    # اگر فونت نبود، همین‌جا (بدون بلاک‌کردن event loop) دانلود می‌شود
+    if not await asyncio.to_thread(ensure_font):
         await callback.answer(
-            "فایل فونت فارسی پیدا نشد؛ ابتدا Vazirmatn-Regular.ttf را کنار bot.py قرار دهید.",
+            "فونت فارسی در دسترس نیست و دانلود آن هم ناموفق بود. کمی بعد دوباره تلاش کنید.",
             show_alert=True,
         )
         return
@@ -716,10 +766,13 @@ async def admin_export_pdf(callback: CallbackQuery) -> None:
     ]
     doc.build(story)
 
-    await callback.message.answer_document(
-        FSInputFile(filename),
-        caption=f"📄 خروجی PDF لیست دانش‌آموزان\n👥 تعداد کل: {len(students)} نفر",
-    )
+    try:
+        await callback.message.answer_document(
+            FSInputFile(filename),
+            caption=f"📄 خروجی PDF لیست دانش‌آموزان\n👥 تعداد کل: {len(students)} نفر",
+        )
+    finally:
+        filename.unlink(missing_ok=True)
     await callback.answer("فایل PDF ارسال شد ✅")
 
 
@@ -763,38 +816,18 @@ async def admin_close_class(callback: CallbackQuery) -> None:
 
 
 # ============================================================
-#  سرور سلامتی (Health Check) برای Render.com
-#  Render انتظار دارد سرویس روی $PORT به درخواست HTTP پاسخ بدهد،
-#  وگرنه آن را "ناسالم" تشخیص داده و مدام ری‌استارتش می‌کند.
-# ============================================================
-async def handle_health(request: web.Request) -> web.Response:
-    return web.Response(text="OK", status=200)
-
-
-async def start_health_server() -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/", handle_health)
-    app.router.add_get("/health", handle_health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-    logger.info("Health check server listening on 0.0.0.0:%s", PORT)
-    return runner
-
-
-# ============================================================
-#  اجرای ربات
+#  اجرای ربات (Polling مستقیم)
 # ============================================================
 async def main() -> None:
-    if BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
+    if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN تنظیم نشده است. آن را در متغیرهای محیطی (Environment Variables) "
-            "روی Render قرار دهید یا مقدار پیش‌فرض بالای فایل را جایگزین کنید."
+            "BOT_TOKEN تنظیم نشده است. آن را در Secrets استریم‌لیت (یا متغیر محیطی) قرار دهید."
         )
+    if not ADMIN_IDS:
+        logger.warning("ADMIN_IDS خالی است؛ هیچ‌کس به پنل /admin دسترسی نخواهد داشت.")
 
     init_db()
+    await asyncio.to_thread(ensure_font)  # دانلود زودهنگام فونت تا اولین PDF دیر نشود
 
     bot = Bot(
         token=BOT_TOKEN,
@@ -803,15 +836,20 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # سرور سلامتی و polling ربات هر دو باید همزمان و در یک event loop اجرا شوند
-    health_runner = await start_health_server()
-
-    logger.info("Bot is starting...")
-    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Bot is starting (polling)...")
     try:
+        # اگر شبکه در لحظه‌ی استارت قطع بود، پروسه نمی‌میرد و تا اتصال دوباره تلاش می‌کند.
+        # (توکن نامعتبر عمداً retry نمی‌شود و خطا می‌دهد.)
+        while True:
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                break
+            except TelegramNetworkError as exc:
+                logger.warning("اتصال به تلگرام برقرار نشد (%s)؛ ۱۰ ثانیه بعد دوباره تلاش می‌شود.", exc)
+                await asyncio.sleep(10)
         await dp.start_polling(bot)
     finally:
-        await health_runner.cleanup()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
